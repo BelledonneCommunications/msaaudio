@@ -29,6 +29,7 @@ struct AAudioInputContext {
 		ms_mutex_init(&stream_mutex, NULL);
 		mTickerSynchronizer = NULL;
 		mAvSkew = 0;
+		prevXRunCount = 0;
 		session_id = AAUDIO_SESSION_ID_NONE;
 		soundCard = NULL;
 		aec = NULL;
@@ -56,6 +57,7 @@ struct AAudioInputContext {
 	int64_t read_samples;
 	int32_t samplesPerFrame;
 	double mAvSkew;
+	int32_t prevXRunCount;
 	aaudio_session_id_t session_id;
 	jobject aec;
 };
@@ -238,16 +240,25 @@ static void android_snd_read_process(MSFilter *obj) {
 			}
 		}
 	}
+
+	if (ictx->stream) {
+		int32_t xRunCount = AAudioStream_getXRunCount(ictx->stream);
+		if (xRunCount != ictx->prevXRunCount) {
+			ms_warning("[AAudio] recorder xRunCount is %0d", xRunCount);
+			ictx->prevXRunCount = xRunCount;
+		}
+	}
 	ms_mutex_unlock(&ictx->stream_mutex);
 
 	ms_mutex_lock(&ictx->mutex);
 	while ((m = getq(&ictx->q)) != NULL) {
 		ms_queue_put(obj->outputs[0], m);
 	}
-	ms_mutex_unlock(&ictx->mutex);
+
 	if (obj->ticker->time % 5000 == 0) {
 		ms_message("[AAudio] sound/wall clock skew is average=%g ms", ictx->mAvSkew);
 	}
+	ms_mutex_unlock(&ictx->mutex);
 }
 
 static void android_snd_read_postprocess(MSFilter *obj) {
