@@ -21,6 +21,7 @@
 
 #include <mediastreamer2/android_utils.h>
 #include <mediastreamer2/msjava.h>
+#include <mediastreamer2/msasync.h>
 
 #include <msaaudio/msaaudio.h>
 
@@ -29,14 +30,69 @@ static const int flowControlThresholdMs = 40;
 
 static void aaudio_player_callback_error(AAudioStream *stream, void *userData, aaudio_result_t error);
 
+static std::string aaudio_content_type_to_string(aaudio_content_type_t contentType) {
+	switch (contentType) {
+		case AAUDIO_CONTENT_TYPE_SPEECH:
+			return "Speech";
+		case AAUDIO_CONTENT_TYPE_MUSIC:
+			return "Music";
+		case AAUDIO_CONTENT_TYPE_MOVIE:
+			return "Movie";
+		case AAUDIO_CONTENT_TYPE_SONIFICATION:
+			return "Sonification";
+		default:
+			return "Unknown (" + std::to_string(contentType) + ")";
+	}
+}
+
+static std::string aaudio_usage_to_string(aaudio_usage_t usage) {
+	switch (usage) {
+		case AAUDIO_USAGE_MEDIA:
+			return "Media";
+		case AAUDIO_USAGE_VOICE_COMMUNICATION:
+			return "Voice Communication";
+		case AAUDIO_USAGE_VOICE_COMMUNICATION_SIGNALLING:
+			return "Voice Communication Signalling";
+		case AAUDIO_USAGE_NOTIFICATION:
+			return "Notification";
+		case AAUDIO_USAGE_NOTIFICATION_RINGTONE:
+			return "Notification (Ringtone)";
+		case AAUDIO_USAGE_NOTIFICATION_EVENT:
+			return "Notification (Event)";
+		case AAUDIO_USAGE_ASSISTANCE_ACCESSIBILITY:
+			return "Assistance (Accessibility)";
+		case AAUDIO_USAGE_ASSISTANCE_NAVIGATION_GUIDANCE:
+			return "Assistance (Navigation Guide)";
+		case AAUDIO_USAGE_ASSISTANCE_SONIFICATION:
+			return "Assistance (Sonification)";
+		case AAUDIO_USAGE_GAME:
+			return "Game";
+		case AAUDIO_USAGE_ASSISTANT:
+			return "Assistant";
+		case AAUDIO_SYSTEM_USAGE_EMERGENCY:
+			return "System (Emergency)";
+		case AAUDIO_SYSTEM_USAGE_SAFETY:
+			return "System (Safety)";
+		case AAUDIO_SYSTEM_USAGE_VEHICLE_STATUS:
+			return "System (Vehicle Status)";
+		case AAUDIO_SYSTEM_USAGE_ANNOUNCEMENT:
+			return "System (Announcement)";
+		default:
+			return "Unknown (" + std::to_string(usage) + ")";
+	}
+}
+
 struct AAudioOutputContext {
 	AAudioOutputContext(MSFilter *f) {
 		sound_utils = ms_factory_get_android_sound_utils(f->factory);
+		aaudio_context = nullptr;
+		stream = nullptr;
 		mFilter = f;
 		sample_rate = ms_android_sound_utils_get_preferred_sample_rate(sound_utils);
 		ms_flow_controlled_bufferizer_init(&buffer, f, sample_rate, 1);
 		ms_mutex_init(&mutex, NULL);
 		ms_mutex_init(&stream_mutex, NULL);
+		process_thread = ms_worker_thread_new("AAudio Player");
 		soundCard = nullptr;
 		usage = AAUDIO_USAGE_VOICE_COMMUNICATION;
 		content_type = AAUDIO_CONTENT_TYPE_SPEECH;
@@ -45,9 +101,15 @@ struct AAudioOutputContext {
 		bufferSize = 0;
 		framesPerBurst = 0;
 		bluetoothScoStarted = false;
+		streamRunning = false;
+		volumeHackRequired = false;
+		task = nullptr;
+		checkForDeviceChange = false;
+		adjustingBufferSize = false;
 	}
 
 	~AAudioOutputContext() {
+		ms_worker_thread_destroy(process_thread, TRUE);
 		ms_flow_controlled_bufferizer_uninit(&buffer);
 		ms_mutex_destroy(&mutex);
 		ms_mutex_destroy(&stream_mutex);
@@ -94,6 +156,7 @@ struct AAudioOutputContext {
 	AAudioContext *aaudio_context;
 	AAudioStream *stream;
 	ms_mutex_t stream_mutex;
+	MSWorkerThread *process_thread;
 
 	MSSndCard *soundCard;
 	MSFilter *mFilter;
@@ -109,6 +172,11 @@ struct AAudioOutputContext {
 	int32_t bufferSize;
 	int32_t framesPerBurst;
 	bool bluetoothScoStarted;
+	bool streamRunning;
+	MSTask *task;
+	bool checkForDeviceChange;
+	bool volumeHackRequired;
+	bool adjustingBufferSize;
 };
 
 static void android_snd_write_init(MSFilter *obj){
@@ -118,10 +186,22 @@ static void android_snd_write_init(MSFilter *obj){
 
 static void android_snd_write_uninit(MSFilter *obj){
 	AAudioOutputContext *octx = static_cast<AAudioOutputContext*>(obj->data);
+
+	if (octx->task) {
+		ms_task_wait_completion(octx->task);
+		ms_task_destroy(octx->task);
+		octx->task = nullptr;
+	}
+
+	// https://github.com/google/oboe/pull/970/
+	// Wait a bit (10ms) to prevent a callback from being dispatched after stop
+	ms_usleep(10000);
+
 	if (octx->soundCard) {
 		ms_snd_card_unref(octx->soundCard);
 		octx->soundCard = nullptr;
 	}
+
 	delete octx;
 }
 
@@ -153,9 +233,13 @@ static int android_snd_write_get_nchannels(MSFilter *obj, void *data) {
 
 static aaudio_data_callback_result_t aaudio_player_callback(AAudioStream *stream, void *userData, void *audioData, int32_t numFrames) {
 	AAudioOutputContext *octx = (AAudioOutputContext*)userData;
+	if (!octx || !octx->stream) {
+		ms_error("[AAudio Player] aaudio_player_callback received when either no context or stream");
+		return AAUDIO_CALLBACK_RESULT_STOP;
+	}
 	
 	if (numFrames <= 0) {
-		ms_error("[AAudio Player] aaudio_player_callback has %i frames", numFrames);
+		ms_error("[AAudio Player] aaudio_player_callback has [%i] frames", numFrames);
 	}
 
 	ms_mutex_lock(&octx->mutex);
@@ -174,19 +258,26 @@ static aaudio_data_callback_result_t aaudio_player_callback(AAudioStream *stream
 	return AAUDIO_CALLBACK_RESULT_CONTINUE;	
 }
 
-static void aaudio_player_init(AAudioOutputContext *octx) {
+static void _aaudio_player_init(AAudioOutputContext *octx, bool skip_update_stream_type) {
+	ms_mutex_lock(&octx->stream_mutex);
+
 	AAudioStreamBuilder *builder;
 	aaudio_result_t result = AAudio_createStreamBuilder(&builder);
 	if (result != AAUDIO_OK && !builder) {
-		ms_error("[AAudio Player] Couldn't create stream builder for player: %i / %s", result, AAudio_convertResultToText(result));
+		ms_error("[AAudio Player] Couldn't create stream builder for player: %s (%i)", AAudio_convertResultToText(result), result);
 	}
 
-	octx->updateStreamTypeFromMsSndCard();
+	if (skip_update_stream_type) {
+		ms_message("[AAudio Player] Stream restarts due to device being changed (probably), do not apply sound card stream type configuration");
+	} else {
+		octx->updateStreamTypeFromMsSndCard();
+	}
+
 	if (ms_android_sound_utils_is_audio_route_changes_disabled(octx->sound_utils)) {
 		ms_warning("[AAudio Player] Not using any device ID because audio route changes are disabled by configuration");
 	} else {
 		AAudioStreamBuilder_setDeviceId(builder, octx->soundCard->internal_id);
-		ms_message("[AAudio Player] Using device ID: %s (%i)", octx->soundCard->id, octx->soundCard->internal_id);
+		ms_message("[AAudio Player] Using device ID: [%s] (%i)", octx->soundCard->id, octx->soundCard->internal_id);
 	}
 
 	AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
@@ -200,22 +291,33 @@ static void aaudio_player_init(AAudioOutputContext *octx) {
 	AAudioStreamBuilder_setUsage(builder, octx->usage); // Requires NDK build target of 28 instead of 26 !
 	AAudioStreamBuilder_setContentType(builder, octx->content_type); // Requires NDK build target of 28 instead of 26 !
 
-	ms_message("[AAudio Player] Player stream configured with samplerate %i and %i channels", octx->sample_rate, octx->aaudio_context->nchannels);
-	
+	ms_message("[AAudio Player] Player stream configured with samplerate [%i] and [%i] channels", octx->sample_rate, octx->aaudio_context->nchannels);
+
 	result = AAudioStreamBuilder_openStream(builder, &(octx->stream));
 	if (result != AAUDIO_OK && !octx->stream) {
-		ms_error("[AAudio Player] Open stream for player failed: %i / %s", result, AAudio_convertResultToText(result));
+		ms_error("[AAudio Player] Open stream for player failed: %s (%i)", AAudio_convertResultToText(result), result);
 		AAudioStreamBuilder_delete(builder);
+		octx->streamRunning = false;
 		octx->stream = nullptr;
+		ms_mutex_unlock(&octx->stream_mutex);
 		return;
 	} else {
 		ms_message("[AAudio Player] Player stream opened");
 	}
 
 	aaudio_content_type_t contentType = AAudioStream_getContentType(octx->stream);
+	if (octx->content_type != contentType) {
+		ms_warning("[AAudio Player] Expected content type [%s] but got [%s]", aaudio_content_type_to_string(octx->content_type).c_str(), aaudio_content_type_to_string(contentType).c_str());
+	} else {
+		ms_message("[AAudio Player] Content type set to [%s]", aaudio_content_type_to_string(contentType).c_str());
+	}
+
 	aaudio_usage_t usage = AAudioStream_getUsage(octx->stream);
-	ms_message("[AAudio Player] Expected content type %i, got %i", octx->content_type, contentType);
-	ms_message("[AAudio Player] Expected usage %i, got %i", octx->usage, usage);
+	if (octx->usage != usage) {
+		ms_warning("[AAudio Player] Expected usage [%s] but got [%s]", aaudio_usage_to_string(octx->usage).c_str(), aaudio_usage_to_string(usage).c_str());
+	} else {
+		ms_message("[AAudio Player] Usage set to [%s]", aaudio_usage_to_string(usage).c_str());
+	}
 
 	octx->framesPerBurst = AAudioStream_getFramesPerBurst(octx->stream);
 	// Set the buffer size to the burst size - this will give us the minimum possible latency
@@ -229,10 +331,11 @@ static void aaudio_player_init(AAudioOutputContext *octx) {
 	result = AAudioStream_requestStart(octx->stream);
 
 	if (result != AAUDIO_OK) {
-		ms_error("[AAudio Player] Start stream for player failed: %i / %s", result, AAudio_convertResultToText(result));
+		octx->streamRunning = false;
+		ms_error("[AAudio Player] Start stream for player failed: %s (%i)", AAudio_convertResultToText(result), result);
 		result = AAudioStream_close(octx->stream);
 		if (result != AAUDIO_OK) {
-			ms_error("[AAudio Player] Player stream close failed: %i / %s", result, AAudio_convertResultToText(result));
+			ms_error("[AAudio Player] Player stream close failed: %s (%i)", AAudio_convertResultToText(result), result);
 		} else {
 			ms_message("[AAudio Player] Player stream closed");
 		}
@@ -243,11 +346,12 @@ static void aaudio_player_init(AAudioOutputContext *octx) {
 
 	AAudioStreamBuilder_delete(builder);
 	if (octx->stream == nullptr) {
+		ms_mutex_unlock(&octx->stream_mutex);
 		return;
 	}
 
 	aaudio_stream_state_t inputState = AAudioStream_getState(octx->stream);
-	ms_message("[AAudio Player] Current state is %i / %s", inputState, AAudio_convertStreamStateToText(inputState));
+	ms_message("[AAudio Player] Current state is [%s]", AAudio_convertStreamStateToText(inputState));
 
 	if (inputState == AAUDIO_STREAM_STATE_STARTING) {
 		aaudio_stream_state_t nextState = inputState;
@@ -258,15 +362,72 @@ static void aaudio_player_init(AAudioOutputContext *octx) {
 			// Waiting more than 0ns can cause a crash
 			aaudio_result_t result = AAudioStream_waitForStateChange(octx->stream, inputState, &nextState, 0);
 			if (result != AAUDIO_OK && result != AAUDIO_ERROR_TIMEOUT) {
-				ms_error("[AAudio Player] Couldn't wait for state change: %i / %s", result, AAudio_convertResultToText(result));
+				ms_error("[AAudio Player] Couldn't wait for state change: %s (%i)", AAudio_convertResultToText(result), result);
 				break;
 			}
 
 			tries += 1;
 		} while (nextState == inputState && tries < 10);
-		ms_message("[AAudio Player] Waited for state change, current state is %i / %s (waited for %i ms)", nextState, AAudio_convertStreamStateToText(nextState), 10*tries);
+		ms_message("[AAudio Player] Waited for state change, current state is [%s] (waited for [%i] ms)", AAudio_convertStreamStateToText(nextState), 10*tries);
 	}
 
+	octx->streamRunning = true;
+	octx->volumeHackRequired = true;
+	ms_mutex_unlock(&octx->stream_mutex);
+	return;
+}
+
+static bool_t aaudio_player_init(AAudioOutputContext *octx) {
+	_aaudio_player_init(octx, FALSE);
+	return TRUE;
+}
+
+static bool_t aaudio_player_init_skip_update_stream_type(AAudioOutputContext *octx) {
+	_aaudio_player_init(octx, TRUE);
+	return TRUE;
+}
+
+static bool_t aaudio_player_close(AAudioOutputContext *octx) {
+	ms_mutex_lock(&octx->stream_mutex);
+
+	if (octx->stream) {
+		octx->streamRunning = false;
+		octx->adjustingBufferSize = false;
+		aaudio_stream_state_t streamState = AAudioStream_getState(octx->stream);
+		ms_message("[AAudio Player] Closing player stream, current state is [%s]", AAudio_convertStreamStateToText(streamState));
+		// According to https://developer.android.com/ndk/guides/audio/aaudio/aaudio#state-transitions
+		// AAudioStream_close can be called from any state
+		aaudio_result_t result = AAudioStream_close(octx->stream);
+		if (result != AAUDIO_OK) {
+			ms_error("[AAudio Player] Player stream close failed: %s (%i)", AAudio_convertResultToText(result), result);
+		} else {
+			ms_message("[AAudio Player] Player stream closed");
+		}
+		octx->stream = nullptr;
+
+		// https://github.com/google/oboe/pull/970/
+		// Wait a bit (10ms) to prevent a callback from being dispatched after stop
+		ms_usleep(10000);
+	}
+
+	ms_mutex_unlock(&octx->stream_mutex);
+	return TRUE;
+}
+
+static bool_t aaudio_player_restart(AAudioOutputContext *octx) {
+	ms_message("[AAudio Player] Restarting stream");
+	aaudio_player_close(octx);
+	_aaudio_player_init(octx, TRUE);
+	ms_message("[AAudio Player] Stream was restarted");
+
+	return TRUE;
+}
+
+static void aaudio_player_callback_error(AAudioStream *stream, void *userData, aaudio_result_t result) {
+	ms_error("[AAudio Player] aaudio_player_callback_error has result: %s (%i)", AAudio_convertResultToText(result), result);
+}
+
+static void anroid_snd_write_require_volume_hack_depending_on_stream(AAudioOutputContext *octx) {
 	if (octx->usage == AAUDIO_USAGE_VOICE_COMMUNICATION || octx->usage == AAUDIO_USAGE_NOTIFICATION_RINGTONE || octx->usage == AAUDIO_USAGE_MEDIA) {
 		std::string streamName = "STREAM_VOICE_CALL";
 		int stream = 0; // https://developer.android.com/reference/android/media/AudioManager#STREAM_VOICE_CALL
@@ -282,31 +443,9 @@ static void aaudio_player_init(AAudioOutputContext *octx) {
 	}
 }
 
-static void aaudio_player_close(AAudioOutputContext *octx) {
-	if (octx->stream) {
-		aaudio_stream_state_t streamState = AAudioStream_getState(octx->stream);
-		ms_message("[AAudio Player] Closing player stream, current state is %i", streamState);
-		// According to https://developer.android.com/ndk/guides/audio/aaudio/aaudio#state-transitions
-		// AAudioStream_close can be called from any state
-		aaudio_result_t result = AAudioStream_close(octx->stream);
-		if (result != AAUDIO_OK) {
-			ms_error("[AAudio Player] Player stream close failed: %i / %s", result, AAudio_convertResultToText(result));
-		} else {
-			ms_message("[AAudio Player] Player stream closed");
-		}
-		octx->stream = NULL;
-	}
-}
-
-static void aaudio_player_callback_error(AAudioStream *stream, void *userData, aaudio_result_t result) {
-	AAudioOutputContext *octx = (AAudioOutputContext *)userData;
-	ms_error("[AAudio Player] aaudio_player_callback_error has result: %i / %s", result, AAudio_convertResultToText(result));
-}
-
 static void android_snd_write_preprocess(MSFilter *obj) {
 	AAudioOutputContext *octx = (AAudioOutputContext*)obj->data;
 	
-	ms_mutex_lock(&octx->stream_mutex);
 	if (ms_snd_card_get_device_type(octx->soundCard) == MSSndCardDeviceType::MS_SND_CARD_DEVICE_TYPE_BLUETOOTH ||
 		ms_snd_card_get_device_type(octx->soundCard) == MSSndCardDeviceType::MS_SND_CARD_DEVICE_TYPE_HEARING_AID)
 	{
@@ -315,52 +454,74 @@ static void android_snd_write_preprocess(MSFilter *obj) {
 		ms_android_sound_utils_enable_bluetooth(octx->sound_utils, octx->bluetoothScoStarted);
 	}
 
-	aaudio_player_init(octx);
-	ms_mutex_unlock(&octx->stream_mutex);
+	ms_worker_thread_add_task(octx->process_thread, (MSTaskFunc)aaudio_player_init, octx);
 }
 
-static void android_snd_adjust_buffer_size(AAudioOutputContext *octx) {
+static bool_t android_snd_adjust_buffer_size(AAudioOutputContext *octx) {
 	// Ensure that stream has been created before adjusting buffer size
-	if (octx->stream) {
-		int32_t xRunCount = AAudioStream_getXRunCount(octx->stream);
-
-		// If underrunning is getting worse
-		if (xRunCount > octx->prevXRunCount) {
-
-			// New buffer size
-			int32_t newBufferSize = octx->bufferSize + octx->framesPerBurst;
-
-			// Buffer size cannot be bigger than the buffer capacity and it must be larger than 0
-			if (octx->bufferCapacity < newBufferSize) {
-				newBufferSize = octx->bufferCapacity;
-			} else if (newBufferSize <= 0) {
-				newBufferSize = 1;
-			}
-
-			ms_message("[AAudio Player] xRunCount %0d - Changing buffer size from %0d to %0d frames (maximum capacity %0d frames)", xRunCount, octx->bufferSize, newBufferSize, octx->bufferCapacity);
-			AAudioStream_setBufferSizeInFrames(octx->stream, newBufferSize);
-
-			octx->bufferSize = newBufferSize;
-			octx->prevXRunCount = xRunCount;
-		}
+	ms_mutex_lock(&octx->stream_mutex);
+	
+	if (octx->adjustingBufferSize && octx->streamRunning && octx->stream) {
+		AAudioStream_setBufferSizeInFrames(octx->stream, octx->bufferSize);
+		octx->adjustingBufferSize = false;
 	}
+
+	ms_mutex_unlock(&octx->stream_mutex);
+	return TRUE;
 }
 
 static void android_snd_write_process(MSFilter *obj) {
 	AAudioOutputContext *octx = (AAudioOutputContext*)obj->data;
 
-	ms_mutex_lock(&octx->stream_mutex);
-	if (!octx->stream) {
-		aaudio_player_init(octx);
-	} else {
+	if (octx->streamRunning && octx->stream) {
 		aaudio_stream_state_t streamState = AAudioStream_getState(octx->stream);
 		if (streamState == AAUDIO_STREAM_STATE_DISCONNECTED) {
 			ms_warning("[AAudio Player] Player stream has disconnected");
-			aaudio_player_close(octx);
+			ms_worker_thread_add_task(octx->process_thread, (MSTaskFunc)aaudio_player_restart, octx);
+		} else {
+			if (octx->volumeHackRequired) {
+				ms_message("[AAudio Player] Audio stream has been started, applying volume hack");
+				anroid_snd_write_require_volume_hack_depending_on_stream(octx);
+				octx->volumeHackRequired = false;
+			}
+
+			if (octx->checkForDeviceChange) {
+				int id = (int)AAudioStream_getDeviceId(octx->stream);
+				if (id != octx->soundCard->internal_id) {
+					ms_warning("[AAudio Player] Device has changed, restarting stream");
+					ms_worker_thread_add_task(octx->process_thread, (MSTaskFunc)aaudio_player_restart, octx);
+				}
+				octx->checkForDeviceChange = false;
+			} else {
+				int32_t xRunCount = AAudioStream_getXRunCount(octx->stream);
+				// If underrunning is getting worse
+				if (xRunCount > octx->prevXRunCount) {
+					if (!octx->adjustingBufferSize) {
+						// New buffer size
+						int32_t newBufferSize = octx->bufferSize + octx->framesPerBurst;
+
+						// Buffer size cannot be bigger than the buffer capacity and it must be larger than 0
+						if (octx->bufferCapacity < newBufferSize) {
+							newBufferSize = octx->bufferCapacity;
+						} else if (newBufferSize <= 0) {
+							newBufferSize = 1;
+						}
+
+						ms_message("[AAudio Player] xRunCount [%0d] - Changing buffer size from [%0d] to [%0d] frames (maximum capacity [%0d] frames)", xRunCount, octx->bufferSize, newBufferSize, octx->bufferCapacity);
+						octx->bufferSize = newBufferSize;
+
+						octx->adjustingBufferSize = true;
+						ms_worker_thread_add_task(octx->process_thread, (MSTaskFunc)android_snd_adjust_buffer_size, octx);
+					}
+
+					octx->prevXRunCount = xRunCount;
+				}
+			}
 		}
+	} else {
+		ms_queue_flush(obj->inputs[0]);
+		return;
 	}
-	android_snd_adjust_buffer_size(octx);
-	ms_mutex_unlock(&octx->stream_mutex);
 
 	ms_mutex_lock(&octx->mutex);
 	ms_flow_controlled_bufferizer_put_from_queue(&octx->buffer, obj->inputs[0]);
@@ -370,8 +531,8 @@ static void android_snd_write_process(MSFilter *obj) {
 static void android_snd_write_postprocess(MSFilter *obj) {
 	AAudioOutputContext *octx = (AAudioOutputContext*)obj->data;
 
-	ms_mutex_lock(&octx->stream_mutex);
-	aaudio_player_close(octx);
+	octx->adjustingBufferSize = false;
+	octx->task = ms_worker_thread_add_waitable_task(octx->process_thread, (MSTaskFunc)aaudio_player_close, octx);
 	
 	if (octx->bluetoothScoStarted) {
 		ms_message("[AAudio Player] We previously started SCO in Android's AudioManager, stopping it now");
@@ -379,7 +540,6 @@ static void android_snd_write_postprocess(MSFilter *obj) {
 		// At the end of a call, postprocess is called therefore here the bluetooth device is disabled
 		ms_android_sound_utils_enable_bluetooth(octx->sound_utils, FALSE);
 	}
-	ms_mutex_unlock(&octx->stream_mutex);
 }
 
 static int android_snd_write_set_device_id(MSFilter *obj, void *data) {
@@ -391,19 +551,14 @@ static int android_snd_write_set_device_id(MSFilter *obj, void *data) {
 		return -1;
 	}
 
-	ms_message("[AAudio Player] Requesting to output card. Current %s (device ID %0d) and requested %s (device ID %0d)", ms_snd_card_get_string_id(octx->soundCard), octx->soundCard->internal_id, ms_snd_card_get_string_id(card), card->internal_id);
+	ms_message("[AAudio Player] Requesting to output card. Current [%s] (device ID %0d) and requested [%s] (device ID %0d)", ms_snd_card_get_string_id(octx->soundCard), octx->soundCard->internal_id, ms_snd_card_get_string_id(card), card->internal_id);
 	// Change device ID only if the new value is different from the previous one
 	if (octx->soundCard->internal_id != card->internal_id) {
-		ms_mutex_lock(&octx->stream_mutex);
 		if (octx->soundCard) {
 			ms_snd_card_unref(octx->soundCard);
 			octx->soundCard = nullptr;
 		}
 		octx->soundCard = ms_snd_card_ref(card);
-
-		if (octx->stream) {
-			aaudio_player_close(octx);
-		}
 
 		bool bluetoothSoundDevice = ms_snd_card_get_device_type(octx->soundCard) == MSSndCardDeviceType::MS_SND_CARD_DEVICE_TYPE_BLUETOOTH ||
 									ms_snd_card_get_device_type(octx->soundCard) == MSSndCardDeviceType::MS_SND_CARD_DEVICE_TYPE_HEARING_AID;
@@ -418,14 +573,15 @@ static int android_snd_write_set_device_id(MSFilter *obj, void *data) {
 			octx->bluetoothScoStarted = bluetoothSoundDevice;
 		}
 
-		aaudio_player_init(octx);
-		if (octx->stream == nullptr) {
-			ms_mutex_unlock(&octx->stream_mutex);
-			return -1;
+		if (octx->streamRunning || octx->stream) {
+			ms_message("[AAudio Player] Requesting the stream to restart to apply new device ID");
+			ms_worker_thread_add_task(octx->process_thread, (MSTaskFunc)aaudio_player_restart, octx);
+		} else {
+			ms_warning("[AAudio Player] No stream, will check when stream will be running if device needs to be updated");
+			octx->checkForDeviceChange = true;
 		}
-
-		ms_mutex_unlock(&octx->stream_mutex);
 	}
+	
 	return 0;
 }
 
